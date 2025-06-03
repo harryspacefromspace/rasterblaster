@@ -2,7 +2,7 @@
 
 *This plugin is experimental*
 
-A QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL’s powerful command-line tools directly into the Georeferencer interface. THis means it'll make use of your computers system resources more than QGIS normally would. It adds buttons for every step—from reading your GCPs through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
+A QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL’s powerful command-line tools directly into the Georeferencer interface. This means it'll make use of your computers system resources more than QGIS normally would. It adds buttons for every step—from reading your GCPs through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
 
 *Disclaimer: I have almost zero coding experience but I decided to create this plugin for my projects and thought others would benefit from it. ChatGPT did help me put this together. Please don't shame me, it's just a tool :)*
 
@@ -31,18 +31,6 @@ Eaach process gives you mutliple options for transformation types (when georefer
 
 
  Each process pops up a simple file-selection dialog, letting you browse for your GCP file, source TIFF, choose transform, compression, and resampling types, and choose an output path—no messy command-line parameters.
- 
-
-**Automatic cleanup**
-
-
- Intermediate VRT files are created in a temporary folder and then deleted once the process completes successfully.
-
-
-**Error handling & feedback**
-
-
- Any subprocess failures show you a Qt critical dialog with GDAL’s stderr. On success, a friendly “Created <filename>” pop-up confirms completion.
 
 
 **Running GDAL Commands**
@@ -55,18 +43,6 @@ When you click Points→GeoTIFF or Points→COG, it:
 - Calls gdalwarp with EPSG:3857 reprojection, Lanczos resampling, tiling/compression options, and a 16 GB cache.  
 - Points→COG instead uses gdalwarp -of COG … so no intermediate GeoTIFF is ever written.  
 - GeoTIFF→COG simply invokes gdal_translate -of COG … on an existing TIFF.  
-
-
-**Benefits to Your Workflow**
-
-
-Speed & convenience: No more toggling back and forth to the OS shell—everything is available from one toolbar.
-
-
-Consistency: All outputs use the same reprojection (Web Mercator) and tiling/compression settings, ensuring reliable performance.
-
-
-Resource control: By dedicating more resources to GDAL high-resolution rasters process more quickly.
 
 
 
