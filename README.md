@@ -26,7 +26,7 @@ This plugin adds three buttons to the QGIS Georeferencer toolbar, as well as und
 
 ### Other notes
 
-**Transformation, Resmapling, and Compression options**
+**Transformation, Resample, and Compression options**
 
 
 Eaach process gives you mutliple options for transformation types (when georeferencing), resampling types, and compression types. I have these preset to my preferred options, but of course you can select which ever you prefer.
