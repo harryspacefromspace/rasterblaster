@@ -19,6 +19,11 @@ This plugin adds three buttons to the QGIS Georeferencer toolbar, as well as und
 
 **GeoTIFF→COG**: Converts an existing GeoTIFF into a COG.
 
+
+*Note: When these processes are running, QGIS often becomes unresponsive. Just be patient and let the task complete as it always comes back once the process is complete in my testing.
+
+
+
 ### Other notes
 
 **Transformation, Resmapling, and Compression options**
