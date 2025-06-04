@@ -76,11 +76,11 @@ class raster_blaster:
         fields = list of (label, key, is_out).
         Keys:
          - "points_file" → filter "*.points"
-         - "transform" → QComboBox with TPS, RPC, Geoloc, Polynomial 1/2/3
-         - "resample"  → QComboBox with all GDAL resampling methods
-         - "compress"  → QComboBox with LZW, JPEG, DEFLATE, PACKBITS
-         - is_out=True → “Save .tif” dialog, auto‐suffix
-         - else → generic “all files” open dialog
+         - "transform"   → QComboBox with TPS, RPC, Geoloc, Polynomial 1/2/3
+         - "resample"    → QComboBox with all GDAL resampling methods
+         - "compress"    → QComboBox with LZW, JPEG, DEFLATE, PACKBITS
+         - is_out=True   → “Save .tif” dialog, auto-suffix
+         - else          → generic “all files” open dialog
         """
         dlg = QDialog()
         dlg.setWindowTitle(title)
@@ -137,33 +137,50 @@ class raster_blaster:
 
             if key == 'points_file':
                 # Only show *.points
-                btn.clicked.connect(lambda _, e=edit: e.setText(
-                    QFileDialog.getOpenFileName(
-                        None, "Select Points File", "", "Points Files (*.points)"
-                    )[0]
-                ))
+                btn.clicked.connect(
+                    lambda _, e=edit: e.setText(
+                        QFileDialog.getOpenFileName(
+                            None,
+                            "Select Points File",
+                            "",
+                            "Points Files (*.points)"
+                        )[0]
+                    )
+                )
 
             elif is_out:
-                # “Save .tif” with auto‐suffix
-                def _save(e, lbl=label, ttl=title):
+                # “Save .tif” with auto-suffix
+                def _save(e, lbl=label, key=key):
                     inp = inputs.get('input_tif')
                     base = os.path.splitext(inp.text())[0] if inp and inp.text() else ''
-                    suffix = "_geotiff.tif" if "GeoTIFF" in ttl else "_cog.tif"
+                    # if the field‐key contains "cog", use "_cog.tif", otherwise "_geotiff.tif"
+                    if "cog" in key:
+                        suffix = "_cog.tif"
+                    else:
+                        suffix = "_geotiff.tif"
                     default = base + suffix
                     path, _ = QFileDialog.getSaveFileName(
-                        None, f"Save {lbl}", default, "TIFF Files (*.tif)"
+                        None,
+                        f"Save {lbl}",
+                        default,
+                        "TIFF Files (*.tif)"
                     )
                     e.setText(path)
 
-                btn.clicked.connect(lambda chk, e=edit: _save(e))
+                btn.clicked.connect(lambda _, e=edit: _save(e))
 
             else:
-                # Generic “All files (*)”
-                btn.clicked.connect(lambda _, e=edit: e.setText(
-                    QFileDialog.getOpenFileName(
-                        None, f"Select {label}", "", "All files (*)"
-                    )[0]
-                ))
+                # Generic “All files (*)” open dialog
+                btn.clicked.connect(
+                    lambda _, e=edit: e.setText(
+                        QFileDialog.getOpenFileName(
+                            None,
+                            f"Select {label}",
+                            "",
+                            "All files (*)"
+                        )[0]
+                    )
+                )
 
             hl.addWidget(lbl)
             hl.addWidget(edit)
@@ -172,10 +189,14 @@ class raster_blaster:
             inputs[key] = edit
 
         run = QPushButton('Run')
-        run.clicked.connect(lambda: callback(*(inputs[k].currentText()
-                                              if isinstance(inputs[k], QComboBox)
-                                              else inputs[k].text()
-                                              for _, k, _ in fields), dlg))
+        run.clicked.connect(
+            lambda: callback(
+                *(inputs[k].currentText() if isinstance(inputs[k], QComboBox)
+                  else inputs[k].text()
+                  for _, k, _ in fields),
+                dlg
+            )
+        )
         layout.addWidget(run)
         dlg.setLayout(layout)
         dlg.exec_()
