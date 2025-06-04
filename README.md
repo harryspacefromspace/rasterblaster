@@ -9,7 +9,7 @@ This also allows people who don't know how to use code or command line interface
 
 ## The Plugin
 
-This plugin adds three buttons to the QGIS Georeferencer toolbar, as well as under the main QGIS toolbar (Plugins>Georeference with GDAL):
+This plugin adds three buttons to the QGIS Georeferencer toolbar, as well as under the main QGIS toolbar (Plugins > Raster Blaster):
 
 
 **Points→GeoTIFF**: Reads your .points file (GCPs) and the input file, creates an intermediate VRT, then warps it to a projected GeoTIFF (EPSG:3857).
@@ -46,9 +46,13 @@ When you click Points→GeoTIFF or Points→COG, it:
 - Reads and filters your .points file (skipping comments).  
 - Constructs a list of -gcp arguments from enabled GCP rows.  
 - Writes out a temporary VRT with gdal_translate -of VRT ….  
-- Calls gdalwarp with EPSG:3857 reprojection, Lanczos resampling, tiling/compression options, and a 16 GB cache.  
+- Calls gdalwarp with EPSG:3857 reprojection, resampling, tiling/compression options.  
 - Points→COG instead uses gdalwarp -of COG … so no intermediate GeoTIFF is ever written.  
 - GeoTIFF→COG simply invokes gdal_translate -of COG … on an existing TIFF.  
+
+### How to install
+- Click on the green Code button at the top of the Raster Blaster github page, and select 'Download ZIP'.
+- Open QGIS, on the toolbar go to Plugins > Manage and Install Plugins > Install from ZIP > select the ZIP file you downloaded > click Install Plugin.
 
 
 
