@@ -2,7 +2,7 @@
 
 *This plugin is experimental. I have almost zero coding experience but I decided to create this plugin for my projects and thought others would benefit from it. ChatGPT did help me put this together. Please don't shame me, it's just a tool that allows a non-coding person like me to make this :)*
 
-A QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL’s powerful command-line tools directly into the Georeferencer interface. This means it'll make use of your computers system resources more than QGIS normally would. It adds buttons for every step—from reading your GCPs through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
+Raster Blaster is a QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL’s powerful command-line tools directly into the Georeferencer interface. This means it'll make use of your computers system resources more than QGIS normally would. It adds buttons for every step—from reading your GCPs .point file through to generating Cloud-Optimized GeoTIFFs (COGs) all without ever leaving QGIS.
 
 This also allows people who don't know how to use code or command line interfaces to use th power of GDAL to speed up their work flows.
 
