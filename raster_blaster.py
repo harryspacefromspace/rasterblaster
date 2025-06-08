@@ -172,10 +172,10 @@ class raster_blaster:
             else:
                 # Generic “All files (*)” open dialog
                 btn.clicked.connect(
-                    lambda _, e=edit: e.setText(
+                    lambda _, e=edit, lbl=label: e.setText(
                         QFileDialog.getOpenFileName(
                             None,
-                            f"Select {label}",
+                            f"Select {lbl}",
                             "",
                             "All files (*)"
                         )[0]
