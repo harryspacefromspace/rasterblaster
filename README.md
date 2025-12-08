@@ -1,58 +1,115 @@
 # Raster Blaster
 
-*This plugin is experimental. I have almost zero coding experience but I decided to create this plugin for my projects and thought others would benefit from it. ChatGPT did help me put this together. Please don't shame me, it's just a tool that allows a non-coding person like me to make this :)*
+Raster Blaster is a QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL's powerful command-line tools directly into the Georeferencer interface. It adds buttons for every step—from reading your GCPs .points file through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
 
-Raster Blaster is a QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL’s powerful command-line tools directly into the Georeferencer interface. This means it'll make use of your computers system resources more than QGIS normally would. It adds buttons for every step—from reading your GCPs .point file through to generating Cloud-Optimized GeoTIFFs (COGs) all without ever leaving QGIS.
+This plugin allows people who don't know how to use code or command line interfaces to harness the full power of GDAL to speed up their workflows.
 
-This also allows people who don't know how to use code or command line interfaces to use the power of GDAL to speed up their work flows.
+## Features
 
+### Three Core Functions
 
-## The Plugin
+- **Points→GeoTIFF**: Reads your .points file (GCPs) and input image, creates an intermediate VRT, then warps it to a projected GeoTIFF in your chosen CRS.
+- **Points→COG**: Same as Points→GeoTIFF, but outputs directly to a Cloud-Optimized GeoTIFF (COG).
+- **GeoTIFF→COG**: Converts an existing GeoTIFF into a COG.
 
-This plugin adds three buttons to the QGIS Georeferencer toolbar, as well as under the main QGIS toolbar (Plugins > Raster Blaster):
+### Background Processing
+All GDAL operations run in a background thread, keeping QGIS fully responsive during processing. You can continue working while your rasters process, and even queue multiple tasks.
 
+### Flexible Options
 
-**Points→GeoTIFF**: Reads your .points file (GCPs) and the input file, creates an intermediate VRT, then warps it to a projected GeoTIFF (EPSG:3857).
+**Target CRS**: Choose any coordinate reference system—no longer hardcoded. Pick from recent CRS, search by name/code, or browse the full list.
 
+**Transformation Types**:
+- TPS (Thin Plate Spline)
+- RPC
+- Geoloc
+- Polynomial (order 1, 2, or 3)
 
-**Points→COG**: Same as Points→GeoTIFF, but warps directly into a Cloud-Optimized GeoTIFF (COG).
+**Resampling Methods**:
+- lanczos (default - best quality)
+- near (fastest)
+- bilinear, cubic, cubicspline
+- average, mode
+- max, min, med
 
+**Compression Options**:
+- JPEG (with adjustable quality 1-100%)
+- LZW, DEFLATE, PACKBITS, ZSTD
+- NONE
 
-**GeoTIFF→COG**: Converts an existing GeoTIFF into a COG.
+### Smart Validation
 
+The plugin checks your GCPs before processing and warns you about potential issues:
 
-*Note: When these processes are running, QGIS often becomes unresponsive. Just be patient and let the task complete as it always comes back once the process is complete in my testing.
+- **GCP count validation**: Ensures you have enough ground control points for your chosen transformation method (e.g., Polynomial order 2 needs at least 6 GCPs)
+- **Distribution warnings**: Alerts you if GCPs are clustered in one area or arranged in a straight line, which can cause poor results
 
+### Quality of Life
 
+- **Persistent settings**: Your preferences (compression, resampling, CRS, etc.) are saved between sessions
+- **Auto-fill output path**: Selecting an input image automatically suggests an output filename
+- **Auto-load results**: Optionally add the processed raster directly to your map
+- **Overwrite protection**: Prompts for confirmation before overwriting existing files
+- **Progress tracking**: See processing status in real-time
 
-### Other notes
+## Installation
 
-**Transformation, Resample, and Compression options**
+1. Download the plugin as a ZIP file from GitHub (Code → Download ZIP)
+2. Open QGIS
+3. Go to **Plugins → Manage and Install Plugins → Install from ZIP**
+4. Select the downloaded ZIP file
+5. Click **Install Plugin**
 
+## Usage
 
-Eaach process gives you mutliple options for transformation types (when georeferencing), resampling types, and compression types. I have these preset to my preferred options, but of course you can select which ever you prefer.
+Access the plugin from:
+- **Menu**: Raster → Raster Blaster → [choose function]
+- **Georeferencer toolbar**: Buttons are added automatically when the Georeferencer window is open
 
+### Basic Workflow
 
-**Single-window dialogs**
+1. Open the Georeferencer and add your GCPs as usual
+2. Save your GCPs to a .points file
+3. Click **Points→GeoTIFF** or **Points→COG**
+4. Select your points file and input image (output path auto-fills)
+5. Choose your target CRS and processing options
+6. Click **Run**
 
+### Tips
 
- Each process pops up a simple file-selection dialog, letting you browse for your GCP file, source TIFF, choose transform, compression, and resampling types, and choose an output path—no messy command-line parameters.
+- **Large files**: Processing may take several minutes for large rasters. The progress indicator keeps you informed.
+- **Compression choice**: Use JPEG for aerial/satellite imagery; LZW or DEFLATE for maps with solid colors or text.
+- **GCP quality**: More GCPs generally means better results, but distribution matters more than quantity. Spread them across corners and edges.
+- **Check the log**: If something goes wrong, check **View → Panels → Log Messages** and look for "Raster Blaster" entries.
 
+## How It Works
 
-**Running GDAL Commands**
+When you run Points→GeoTIFF or Points→COG:
 
+1. Parses your .points file (supports UTF-8 and Windows-1252 encoding)
+2. Validates GCP count and distribution for your chosen transformation
+3. Builds GCP arguments for GDAL
+4. Creates a temporary VRT with `gdal_translate -of VRT`
+5. Runs `gdalwarp` with your chosen CRS, resampling, and compression
+6. Cleans up temporary files
+7. Optionally loads the result into QGIS
 
-When you click Points→GeoTIFF or Points→COG, it:  
-- Reads and filters your .points file (skipping comments).  
-- Constructs a list of -gcp arguments from enabled GCP rows.  
-- Writes out a temporary VRT with gdal_translate -of VRT ….  
-- Calls gdalwarp with EPSG:3857 reprojection, resampling, tiling/compression options.  
-- Points→COG instead uses gdalwarp -of COG … so no intermediate GeoTIFF is ever written.  
-- GeoTIFF→COG simply invokes gdal_translate -of COG … on an existing TIFF.  
+The plugin uses multi-threading (`GDAL_NUM_THREADS=ALL_CPUS`) to maximize performance.
 
-### How to install
-- Click on the green Code button at the top of the Raster Blaster github page, and select 'Download ZIP'.
-- Open QGIS, on the toolbar go to Plugins > Manage and Install Plugins > Install from ZIP > select the ZIP file you downloaded > click Install Plugin.
+## Requirements
 
+- QGIS 3.0 or later
+- GDAL (included with QGIS)
 
+## License
 
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
+
+## Support
+
+- **Issues**: https://github.com/harryspacefromspace/rasterblaster/issues
+- **Repository**: https://github.com/harryspacefromspace/rasterblaster
+
+## Credits
+
+Created by Harry Stranger (harry@spacefromspace.com)
