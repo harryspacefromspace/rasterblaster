@@ -1,22 +1,27 @@
 [general]
 name=Raster Blaster
 description=Speed up georeferencing processing using GDAL and full system resources.
-version=2.0.0
+version=2.1.0
 qgisMinimumVersion=3.0
-author=Harry Stranger	
+author=Harry Stranger
 email=harry@spacefromspace.com
 
-about= QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL’s powerful command-line tools directly into the Georeferencer interface and utilising your systems available resources. It adds buttons for every step—from reading your GCPs through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
+about=QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL's powerful command-line tools directly into the Georeferencer interface and utilising your system's available resources. It adds buttons for every step—from reading your GCPs through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS. Features include background processing, user-selectable CRS, GCP validation warnings, and persistent settings.
 
 tracker=https://github.com/harryspacefromspace/rasterblaster/issues
 homepage=https://github.com/harryspacefromspace/rasterblaster
 repository=https://github.com/harryspacefromspace/rasterblaster
 
+changelog=https://github.com/harryspacefromspace/rasterblaster/blob/main/CHANGELOG.md
+
 # Tags are comma separated with spaces allowed
-tags=georeferencing, raster, vrt, gdal, cog, geotiff
+tags=georeferencing, raster, vrt, gdal, cog, geotiff, cloud optimized
 
 # experimental flag
-experimental=True
+experimental=False
 
-Category of the plugin: Raster, Vector, Database or Web
+# Qt6 support
+supportsQt6=True
+
+# Category of the plugin: Raster, Vector, Database or Web
 category=Raster
