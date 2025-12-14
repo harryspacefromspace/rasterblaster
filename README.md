@@ -98,7 +98,7 @@ The plugin uses multi-threading (`GDAL_NUM_THREADS=ALL_CPUS`) to maximize perfor
 
 ## Requirements
 
-- QGIS 3.0 or later
+- QGIS 3.0 or later (compatible with both Qt5 and Qt6 versions)
 - GDAL (included with QGIS)
 
 ## License
