@@ -32,6 +32,16 @@ from qgis.core import (
 )
 from qgis.gui import QgsProjectionSelectionWidget
 
+# Qt5/Qt6 compatibility for QMessageBox button enums
+try:
+    # Qt6 style
+    QMessageBoxYes = QMessageBox.StandardButton.Yes
+    QMessageBoxNo = QMessageBox.StandardButton.No
+except AttributeError:
+    # Qt5 style
+    QMessageBoxYes = QMessageBox.Yes
+    QMessageBoxNo = QMessageBox.No
+
 
 class GdalTask(QgsTask):
     """
@@ -239,18 +249,6 @@ class raster_blaster:
     def save_setting(self, key, value):
         """Save a setting."""
         self.settings.setValue(self.SETTINGS_PREFIX + key, value)
-    
-    def get_last_directory(self):
-        """Get last used directory, or home if not set."""
-        last_dir = self.get_setting(self.SETTING_LAST_DIR)
-        if last_dir and os.path.isdir(last_dir):
-            return last_dir
-        return os.path.expanduser('~')
-    
-    def save_last_directory(self, filepath):
-        """Save the directory of a file path."""
-        if filepath:
-            self.save_setting(self.SETTING_LAST_DIR, os.path.dirname(filepath))
 
     # =========================================================================
     # Dialog builder
@@ -375,13 +373,12 @@ class raster_blaster:
                 def make_browse_points(edit_widget):
                     def browse_points():
                         path, _ = QFileDialog.getOpenFileName(
-                            dlg, "Select Points File",
-                            self.get_last_directory(),
+                            None, "Select Points File",
+                            "",
                             "Points Files (*.points);;All Files (*)"
                         )
                         if path:
                             edit_widget.setText(path)
-                            self.save_last_directory(path)
                     return browse_points
                 btn.clicked.connect(make_browse_points(edit))
                 hl.addWidget(lbl)
@@ -393,13 +390,12 @@ class raster_blaster:
                 def make_browse_input(edit_widget, all_inputs, all_fields):
                     def browse_input():
                         path, _ = QFileDialog.getOpenFileName(
-                            dlg, "Select Input Image",
-                            self.get_last_directory(),
+                            None, "Select Input Image",
+                            "",
                             "Image Files (*.tif *.tiff *.jpg *.jpeg *.png);;All Files (*)"
                         )
                         if path:
                             edit_widget.setText(path)
-                            self.save_last_directory(path)
                             
                             # Auto-fill output field if empty
                             for flabel, fkey, ftype in all_fields:
@@ -428,15 +424,14 @@ class raster_blaster:
                         if inp and inp.text():
                             base = os.path.splitext(inp.text())[0] + sfx
                         path, _ = QFileDialog.getSaveFileName(
-                            dlg, "Save Output",
-                            base or self.get_last_directory(),
+                            None, "Save Output",
+                            base,
                             "TIFF Files (*.tif)"
                         )
                         if path:
                             if not path.lower().endswith('.tif'):
                                 path += '.tif'
                             edit_widget.setText(path)
-                            self.save_last_directory(path)
                     return browse_output
                 btn.clicked.connect(make_browse_output(edit, suffix))
                 hl.addWidget(lbl)
@@ -518,7 +513,12 @@ class raster_blaster:
         layout.addLayout(btn_layout)
         
         dlg.setLayout(layout)
-        dlg.exec_()
+        
+        # Qt5/Qt6 compatibility: exec_() renamed to exec() in Qt6
+        if hasattr(dlg, 'exec'):
+            dlg.exec()
+        else:
+            dlg.exec_()
 
     # =========================================================================
     # GeoTIFF → COG
@@ -557,9 +557,9 @@ class raster_blaster:
             reply = QMessageBox.question(
                 dlg, "File Exists",
                 f"Output file already exists:\n{os.path.basename(cog)}\n\nOverwrite?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
             # Delete existing file
             try:
@@ -676,9 +676,9 @@ class raster_blaster:
             reply = QMessageBox.question(
                 dlg, "File Exists",
                 f"Output file already exists:\n{os.path.basename(out_tif)}\n\nOverwrite?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
             try:
                 os.remove(out_tif)
@@ -704,9 +704,9 @@ class raster_blaster:
         if warning_msg:
             reply = QMessageBox.warning(
                 dlg, "GCP Warning", warning_msg,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
         
         # Check GCP distribution
@@ -714,9 +714,9 @@ class raster_blaster:
         if distribution_warning:
             reply = QMessageBox.warning(
                 dlg, "GCP Distribution Warning", distribution_warning,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
         
         # Create temp VRT path
@@ -852,9 +852,9 @@ class raster_blaster:
             reply = QMessageBox.question(
                 dlg, "File Exists",
                 f"Output file already exists:\n{os.path.basename(out_cog)}\n\nOverwrite?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
             try:
                 os.remove(out_cog)
@@ -880,9 +880,9 @@ class raster_blaster:
         if warning_msg:
             reply = QMessageBox.warning(
                 dlg, "GCP Warning", warning_msg,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
         
         # Check GCP distribution
@@ -890,9 +890,9 @@ class raster_blaster:
         if distribution_warning:
             reply = QMessageBox.warning(
                 dlg, "GCP Distribution Warning", distribution_warning,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                QMessageBoxYes | QMessageBoxNo, QMessageBoxNo
             )
-            if reply == QMessageBox.No:
+            if reply == QMessageBoxNo:
                 return
         
         # Create temp VRT
