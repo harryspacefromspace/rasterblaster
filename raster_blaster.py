@@ -199,11 +199,39 @@ class raster_blaster:
         self.act_cog = QAction(icon, "GeoTIFF→COG", self.iface.mainWindow())
         self.act_cog.triggered.connect(self.gdal_cog_dialog)
         self.iface.addPluginToRasterMenu("&Raster Blaster", self.act_cog)
+        
+        # Create main QGIS toolbar
+        self.toolbar = self.iface.addToolBar("Raster Blaster")
+        self.toolbar.setObjectName("RasterBlasterToolbar")
+        
+        # Create separate actions for toolbar (so they can have different text/tooltips)
+        self.tb_act_full = QAction(icon, "Points→GeoTIFF", self.iface.mainWindow())
+        self.tb_act_full.setToolTip("Convert points file + image to GeoTIFF")
+        self.tb_act_full.triggered.connect(self.full_process_dialog)
+        self.toolbar.addAction(self.tb_act_full)
+        
+        self.tb_act_to_cog = QAction(icon, "Points→COG", self.iface.mainWindow())
+        self.tb_act_to_cog.setToolTip("Convert points file + image to Cloud-Optimized GeoTIFF")
+        self.tb_act_to_cog.triggered.connect(self.full_to_cog_dialog)
+        self.toolbar.addAction(self.tb_act_to_cog)
+        
+        self.tb_act_cog = QAction(icon, "GeoTIFF→COG", self.iface.mainWindow())
+        self.tb_act_cog.setToolTip("Convert GeoTIFF to Cloud-Optimized GeoTIFF")
+        self.tb_act_cog.triggered.connect(self.gdal_cog_dialog)
+        self.toolbar.addAction(self.tb_act_cog)
 
     def unload(self):
+        # Remove menu items
         for act in (self.act_full, self.act_to_cog, self.act_cog):
             try:
                 self.iface.removePluginRasterMenu("&Raster Blaster", act)
+            except Exception:
+                pass
+        
+        # Remove toolbar
+        if hasattr(self, 'toolbar') and self.toolbar:
+            try:
+                del self.toolbar
             except Exception:
                 pass
 
@@ -251,10 +279,155 @@ class raster_blaster:
         self.settings.setValue(self.SETTINGS_PREFIX + key, value)
 
     # =========================================================================
+    # Georeferencer detection
+    # =========================================================================
+    
+    def get_georeferencer_info(self):
+        """
+        Get information from the Georeferencer if it's open.
+        Optimized for speed - prioritizes fast detection methods.
+        
+        Returns dict with:
+            'input_file': path to the raster being georeferenced (or None)
+            'points_file': path to the .points file (or None)
+            'georeferencer_open': True if Georeferencer window is found
+        """
+        result = {
+            'input_file': None,
+            'points_file': None,
+            'georeferencer_open': False
+        }
+        
+        # Find the Georeferencer window
+        georef_window = None
+        for w in QApplication.topLevelWidgets():
+            class_name = w.metaObject().className()
+            if class_name == 'QgsGeoreferencerMainWindow':
+                georef_window = w
+                result['georeferencer_open'] = True
+                break
+        
+        if not georef_window:
+            return result
+        
+        filename_from_title = None
+        
+        # Method 1: Parse window title (FAST)
+        try:
+            window_title = georef_window.windowTitle()
+            if ' - ' in window_title:
+                potential_path = window_title.split(' - ', 1)[-1].strip()
+                if potential_path:
+                    if os.path.exists(potential_path):
+                        result['input_file'] = potential_path
+                    else:
+                        filename_from_title = potential_path
+        except Exception:
+            pass
+        
+        # Method 2: Check status bar current message (FAST)
+        if not result['input_file']:
+            try:
+                from qgis.PyQt.QtWidgets import QStatusBar
+                status_bar = georef_window.findChild(QStatusBar)
+                if status_bar:
+                    current_msg = status_bar.currentMessage()
+                    if current_msg and ':' in current_msg:
+                        potential_path = current_msg.split(':', 1)[-1].strip()
+                        if potential_path and os.path.exists(potential_path):
+                            result['input_file'] = potential_path
+            except Exception:
+                pass
+        
+        # Method 3: Check map canvas layers (FAST)
+        if not result['input_file']:
+            try:
+                from qgis.gui import QgsMapCanvas
+                canvases = georef_window.findChildren(QgsMapCanvas)
+                for canvas in canvases:
+                    layers = canvas.layers()
+                    for layer in layers:
+                        if layer and hasattr(layer, 'source'):
+                            source = layer.source()
+                            if source and os.path.exists(source):
+                                result['input_file'] = source
+                                break
+                    if result['input_file']:
+                        break
+            except Exception:
+                pass
+        
+        # Method 4: Quick check georeferencer settings (FAST - only georef keys)
+        if not result['input_file'] and filename_from_title:
+            try:
+                settings = QgsSettings()
+                # Only scan keys containing 'georef' - much faster than all keys
+                all_keys = settings.allKeys()
+                georef_keys = [k for k in all_keys if 'georef' in k.lower()]
+                
+                for key in georef_keys:
+                    val = settings.value(key, '')
+                    if val and isinstance(val, str):
+                        # Check if this is a file path ending with our filename
+                        if val.endswith(filename_from_title) and os.path.exists(val):
+                            result['input_file'] = val
+                            break
+                        # Check if this is a directory containing our file
+                        if os.path.isdir(val):
+                            potential_path = os.path.join(val, filename_from_title)
+                            if os.path.exists(potential_path):
+                                result['input_file'] = potential_path
+                                break
+            except Exception:
+                pass
+        
+        # Method 5: Check our plugin's last used directory (FAST)
+        if not result['input_file'] and filename_from_title:
+            try:
+                last_dir = self.get_setting(self.SETTING_LAST_DIR, '')
+                if last_dir and os.path.isdir(last_dir):
+                    potential_path = os.path.join(last_dir, filename_from_title)
+                    if os.path.exists(potential_path):
+                        result['input_file'] = potential_path
+            except Exception:
+                pass
+        
+        # Find matching .points file if we found the input file
+        if result['input_file']:
+            input_dir = os.path.dirname(result['input_file'])
+            input_basename = os.path.splitext(os.path.basename(result['input_file']))[0]
+            
+            # First try exact match
+            exact_points = os.path.splitext(result['input_file'])[0] + '.points'
+            if os.path.exists(exact_points):
+                result['points_file'] = exact_points
+            else:
+                # Search folder for .points files
+                try:
+                    points_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.points')]
+                    if len(points_files) == 1:
+                        result['points_file'] = os.path.join(input_dir, points_files[0])
+                    elif len(points_files) > 1:
+                        # Find best match
+                        for pf in points_files:
+                            pf_base = os.path.splitext(pf)[0].lower()
+                            if input_basename.lower() in pf_base or pf_base in input_basename.lower():
+                                result['points_file'] = os.path.join(input_dir, pf)
+                                break
+                        if not result['points_file']:
+                            # Use most recent
+                            points_paths = [os.path.join(input_dir, f) for f in points_files]
+                            result['points_file'] = max(points_paths, key=os.path.getmtime)
+                except Exception:
+                    pass
+        
+        return result
+
+    # =========================================================================
     # Dialog builder
     # =========================================================================
     
-    def _gdal_dialog(self, title, fields, callback):
+    def _gdal_dialog(self, title, fields, callback, initial_values=None):
         """
         Build a dialog with file selectors, dropdowns, and options.
         
@@ -269,7 +442,12 @@ class raster_blaster:
             - 'compress': compression dropdown
             - 'crs': CRS selector widget
             - 'jpeg_quality': JPEG quality spinbox
+        
+        initial_values: optional dict of {key: value} for pre-filling fields
         """
+        if initial_values is None:
+            initial_values = {}
+        
         dlg = QDialog(self.iface.mainWindow())
         dlg.setWindowTitle(title)
         dlg.setMinimumWidth(500)
@@ -440,6 +618,10 @@ class raster_blaster:
                 file_layout.addLayout(hl)
             
             inputs[key] = edit
+            
+            # Pre-fill from initial_values if provided
+            if key in initial_values and initial_values[key]:
+                edit.setText(initial_values[key])
         
         # Add groups to main layout
         file_group.setLayout(file_layout)
@@ -633,6 +815,18 @@ class raster_blaster:
     # =========================================================================
     
     def full_process_dialog(self):
+        # Try to get info from the Georeferencer if it's open
+        georef_info = self.get_georeferencer_info()
+        
+        # Build initial values dict
+        initial_values = {}
+        if georef_info['input_file']:
+            initial_values['input_file'] = georef_info['input_file']
+            # Auto-generate output path with _georef suffix
+            initial_values['output_file'] = os.path.splitext(georef_info['input_file'])[0] + '_georef.tif'
+        if georef_info['points_file']:
+            initial_values['points_file'] = georef_info['points_file']
+        
         self._gdal_dialog('Points → GeoTIFF', [
             ('Points File', 'points_file', 'points_file'),
             ('Input Image', 'input_file', 'input_file'),
@@ -642,7 +836,7 @@ class raster_blaster:
             ('Compression', 'compress', 'compress'),
             ('JPEG Quality', 'jpeg_quality', 'jpeg_quality'),
             ('Output GeoTIFF', 'output_file', 'output_geotiff')
-        ], self.full_process)
+        ], self.full_process, initial_values)
 
     def full_process(self, values):
         """Create GeoTIFF from points file using background task."""
@@ -809,6 +1003,18 @@ class raster_blaster:
     # =========================================================================
     
     def full_to_cog_dialog(self):
+        # Try to get info from the Georeferencer if it's open
+        georef_info = self.get_georeferencer_info()
+        
+        # Build initial values dict
+        initial_values = {}
+        if georef_info['input_file']:
+            initial_values['input_file'] = georef_info['input_file']
+            # Auto-generate output path with _cog suffix
+            initial_values['output_file'] = os.path.splitext(georef_info['input_file'])[0] + '_cog.tif'
+        if georef_info['points_file']:
+            initial_values['points_file'] = georef_info['points_file']
+        
         self._gdal_dialog('Points → COG', [
             ('Points File', 'points_file', 'points_file'),
             ('Input Image', 'input_file', 'input_file'),
@@ -818,7 +1024,7 @@ class raster_blaster:
             ('Compression', 'compress', 'compress'),
             ('JPEG Quality', 'jpeg_quality', 'jpeg_quality'),
             ('Output COG', 'output_file', 'output_cog')
-        ], self.full_to_cog)
+        ], self.full_to_cog, initial_values)
 
     def full_to_cog(self, values):
         """Create COG from points file using background task."""
