@@ -1,7 +1,7 @@
 [general]
 name=Raster Blaster
 description=Speed up georeferencing processing using GDAL and full system resources.
-version=2.5.0
+version=2.5.1
 qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
 author=Harry Stranger
@@ -14,11 +14,12 @@ homepage=https://github.com/harryspacefromspace/rasterblaster
 repository=https://github.com/harryspacefromspace/rasterblaster
 
 changelog-qgis4=
-    2.5.0:
+    2.5.1:
     - Now drives GDAL through the osgeo.gdal Python API instead of the gdal_translate/gdalwarp command-line tools: real progress bar, no PATH setup, no temp .vrt files, handles large GCP sets
     - Uses the whole machine by default (all CPUs, RAM-scaled block cache) with a new Performance panel to dial threads/cache down
     - Points->GeoTIFF output is now multithreaded and gets internal overviews
     - Fixed: WEBP quality slider was ignored for COG outputs; custom (non-EPSG) CRS now works
+    - Qt6 compatibility checker and Bandit warnings cleared
     2.4.x:
     - QGIS4 menu / map-layer API fallbacks; transparency preserved for all compressions
     https://github.com/harryspacefromspace/rasterblaster/blob/main/CHANGELOG.md
