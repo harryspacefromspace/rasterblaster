@@ -29,8 +29,5 @@ tags=georeferencing, raster, vrt, gdal, cog, geotiff, cloud optimized
 # experimental flag
 experimental=False
 
-# Qt6 support
-supportsQt6=True
-
 # Category of the plugin: Raster, Vector, Database or Web
 category=Raster

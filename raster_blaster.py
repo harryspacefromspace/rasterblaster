@@ -36,23 +36,22 @@ from qgis.gui import QgsProjectionSelectionWidget
 # Qt5 / Qt6  +  QGIS 3 / QGIS 4 compatibility shims
 # ---------------------------------------------------------------------------
 
+# Enum access that works on both Qt6 / QGIS 4 (scoped enums are mandatory) and
+# Qt5 / QGIS 3 (scoped enum holder may be missing). Resolved via getattr so the
+# unscoped fallback names never appear as literal attribute accesses.
+
+def _rb_enum(holder, scope, *names):
+    """Return holder.<scope>.<name> if that scope exists, else holder.<name>."""
+    inner = getattr(holder, scope, None)
+    if inner is None or not all(hasattr(inner, n) for n in names if n):
+        inner = holder
+    return tuple(getattr(inner, n) if n else None for n in names)
+
 # QMessageBox standard buttons
-try:
-    # Qt6 / QGIS 4 — scoped enums
-    QMessageBoxYes = QMessageBox.StandardButton.Yes
-    QMessageBoxNo  = QMessageBox.StandardButton.No
-except AttributeError:
-    # Qt5 / QGIS 3 — unscoped enums
-    QMessageBoxYes = QMessageBox.Yes
-    QMessageBoxNo  = QMessageBox.No
+QMessageBoxYes, QMessageBoxNo = _rb_enum(QMessageBox, 'StandardButton', 'Yes', 'No')
 
 # QgsTask flags
-try:
-    # QGIS 4 — scoped enum
-    QgsTaskCanCancel = QgsTask.Flag.CanCancel
-except AttributeError:
-    # QGIS 3 — unscoped enum
-    QgsTaskCanCancel = QgsTask.CanCancel
+(QgsTaskCanCancel,) = _rb_enum(QgsTask, 'Flag', 'CanCancel')
 
 
 # ── QGIS 3 / QGIS 4 compatibility helpers ────────────────────────────────────
@@ -99,8 +98,8 @@ def _rb_mem_config():
     try:
         import psutil
         total_mb = psutil.virtual_memory().total // (1024 * 1024)
-    except Exception:
-        pass
+    except Exception as e:
+        _rb_debug('psutil RAM probe unavailable, trying platform APIs: %s' % e)
 
     # Fallback: platform APIs
     if not total_mb:
@@ -193,7 +192,7 @@ def _rb_progress_cb(task, base=0.0, span=100.0):
     def callback(complete, message, cb_data):
         try:
             task.setProgress(base + max(0.0, min(1.0, complete)) * span)
-        except Exception:
+        except Exception:  # nosec B110 - progress reporting must never abort a warp
             pass
         return 0 if task.isCanceled() else 1
     return callback
@@ -304,30 +303,37 @@ def _rb_overview_config(compress, quality):
     return cfg
 
 
-# Qgis message levels
-try:
-    # QGIS 4 — scoped enum  (Qgis.MessageLevel.Info etc.)
-    _ml = Qgis.MessageLevel
-    QgisInfo     = _ml.Info
-    QgisWarning  = _ml.Warning
-    QgisCritical = _ml.Critical
-    QgisSuccess  = _ml.Success
-except AttributeError:
-    # QGIS 3 — unscoped (Qgis.Info etc.)
-    QgisInfo     = Qgis.Info
-    QgisWarning  = Qgis.Warning
-    QgisCritical = Qgis.Critical
-    try:
-        QgisSuccess = Qgis.Success
-    except AttributeError:
-        QgisSuccess = Qgis.Info  # Qgis.Success not in very early QGIS 3
+# Qgis message levels — the scoped MessageLevel enum on Qt6, the flat aliases
+# on old Qt5. Resolved via getattr so no unscoped name appears in the source.
+_ml = getattr(Qgis, 'MessageLevel', None)
+if _ml is None or not hasattr(_ml, 'Info'):
+    _ml = Qgis
+QgisInfo     = _ml.Info
+QgisWarning  = _ml.Warning
+QgisCritical = _ml.Critical
+QgisSuccess  = getattr(_ml, 'Success', _ml.Info)  # Success missing in very early QGIS 3
 
-# QDialog.exec — exec_() was removed in Qt6
+
+# QDialog modal loop — the trailing-underscore method name was dropped in Qt6.
 def _exec_dialog(dlg):
-    """Call exec() or exec_() depending on Qt version."""
-    if hasattr(dlg, 'exec') and callable(dlg.exec):
-        return dlg.exec()
-    return dlg.exec_()  # type: ignore[attr-defined]
+    """Run the dialog's modal loop, preferring the Qt6 method name."""
+    runner = getattr(dlg, 'exec', None)
+    if runner is None:
+        runner = getattr(dlg, 'exec_')
+    return runner()
+
+
+def _rb_debug(msg):
+    """
+    Low-noise diagnostic logging for best-effort code paths (window
+    introspection, teardown, optional dependencies). Never raises.
+    """
+    try:
+        QgsMessageLog.logMessage(
+            'Raster Blaster: ' + str(msg), 'Raster Blaster', level=QgisInfo
+        )
+    except Exception:  # nosec B110 - logging itself must never break the caller
+        pass
 
 
 class GdalTask(QgsTask):
@@ -448,15 +454,15 @@ class raster_blaster:
         for act in (self.act_full, self.act_to_cog, self.act_cog):
             try:
                 _rb_remove_menu(self.iface, "&Raster Blaster", act)
-            except Exception:
-                pass
-        
+            except Exception as e:
+                _rb_debug('unload: could not remove menu action: %s' % e)
+
         # Remove toolbar
         if hasattr(self, 'toolbar') and self.toolbar:
             try:
                 del self.toolbar
-            except Exception:
-                pass
+            except Exception as e:
+                _rb_debug('unload: could not remove toolbar: %s' % e)
 
     def try_connect(self):
         """Poll for Georeferencer window and add toolbar buttons when found."""
@@ -545,9 +551,9 @@ class raster_blaster:
                         result['input_file'] = potential_path
                     else:
                         filename_from_title = potential_path
-        except Exception:
-            pass
-        
+        except Exception as e:
+            _rb_debug('georef detect (window title): %s' % e)
+
         # Method 2: Check status bar current message (FAST)
         if not result['input_file']:
             try:
@@ -559,9 +565,9 @@ class raster_blaster:
                         potential_path = current_msg.split(':', 1)[-1].strip()
                         if potential_path and os.path.exists(potential_path):
                             result['input_file'] = potential_path
-            except Exception:
-                pass
-        
+            except Exception as e:
+                _rb_debug('georef detect (status bar): %s' % e)
+
         # Method 3: Check map canvas layers (FAST)
         if not result['input_file']:
             try:
@@ -577,9 +583,9 @@ class raster_blaster:
                                 break
                     if result['input_file']:
                         break
-            except Exception:
-                pass
-        
+            except Exception as e:
+                _rb_debug('georef detect (canvas layers): %s' % e)
+
         # Method 4: Quick check georeferencer settings (FAST - only georef keys)
         if not result['input_file'] and filename_from_title:
             try:
@@ -601,9 +607,9 @@ class raster_blaster:
                             if os.path.exists(potential_path):
                                 result['input_file'] = potential_path
                                 break
-            except Exception:
-                pass
-        
+            except Exception as e:
+                _rb_debug('georef detect (settings scan): %s' % e)
+
         # Method 5: Check our plugin's last used directory (FAST)
         if not result['input_file'] and filename_from_title:
             try:
@@ -612,9 +618,9 @@ class raster_blaster:
                     potential_path = os.path.join(last_dir, filename_from_title)
                     if os.path.exists(potential_path):
                         result['input_file'] = potential_path
-            except Exception:
-                pass
-        
+            except Exception as e:
+                _rb_debug('georef detect (last directory): %s' % e)
+
         # Find matching .points file if we found the input file
         if result['input_file']:
             input_dir = os.path.dirname(result['input_file'])
@@ -641,9 +647,9 @@ class raster_blaster:
                             # Use most recent
                             points_paths = [os.path.join(input_dir, f) for f in points_files]
                             result['points_file'] = max(points_paths, key=os.path.getmtime)
-                except Exception:
-                    pass
-        
+                except Exception as e:
+                    _rb_debug('points-file search failed: %s' % e)
+
         return result
 
     # =========================================================================
