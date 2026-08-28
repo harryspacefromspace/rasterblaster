@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Raster Blaster - Improved Version
+Raster Blaster
 A QGIS plugin for streamlined raster georeferencing using GDAL.
 
-Quick Wins Implemented:
-1. Background processing with QgsTask (no more UI freezes)
-2. Progress bar support
-3. User-selectable CRS (not hardcoded to EPSG:3857)
-4. Persistent settings (remembers your preferences)
-5. Auto-load results into QGIS
+- Background processing with QgsTask (no UI freezes), real progress + cancel
+- Drives GDAL through the osgeo.gdal Python API (no subprocess / PATH / temp
+  .vrt dependencies, no command-line length limits on large GCP sets)
+- Uses the whole machine: all CPUs and a RAM-scaled block cache by default,
+  with a Performance panel to dial threads / cache down
+- User-selectable CRS, persistent settings, auto-load results into QGIS
 """
 
 import os
-import subprocess
 import csv
-import tempfile
 import time
-import re
+from contextlib import contextmanager
 
-from qgis.PyQt.QtCore import QTimer, Qt
+from osgeo import gdal
+
+from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import (
     QAction, QApplication, QFileDialog, QMessageBox,
@@ -26,134 +26,355 @@ from qgis.PyQt.QtWidgets import (
     QToolBar, QComboBox, QCheckBox, QProgressBar, QGroupBox, QSpinBox
 )
 from qgis.core import (
-    QgsMessageLog, Qgis, QgsTask, QgsApplication, 
+    QgsMessageLog, Qgis, QgsTask, QgsApplication,
     QgsRasterLayer, QgsProject, QgsSettings,
     QgsCoordinateReferenceSystem
 )
 from qgis.gui import QgsProjectionSelectionWidget
 
-# Qt5/Qt6 compatibility for QMessageBox button enums
+# ---------------------------------------------------------------------------
+# Qt5 / Qt6  +  QGIS 3 / QGIS 4 compatibility shims
+# ---------------------------------------------------------------------------
+
+# QMessageBox standard buttons
 try:
-    # Qt6 style
+    # Qt6 / QGIS 4 — scoped enums
     QMessageBoxYes = QMessageBox.StandardButton.Yes
-    QMessageBoxNo = QMessageBox.StandardButton.No
+    QMessageBoxNo  = QMessageBox.StandardButton.No
 except AttributeError:
-    # Qt5 style
+    # Qt5 / QGIS 3 — unscoped enums
     QMessageBoxYes = QMessageBox.Yes
-    QMessageBoxNo = QMessageBox.No
+    QMessageBoxNo  = QMessageBox.No
+
+# QgsTask flags
+try:
+    # QGIS 4 — scoped enum
+    QgsTaskCanCancel = QgsTask.Flag.CanCancel
+except AttributeError:
+    # QGIS 3 — unscoped enum
+    QgsTaskCanCancel = QgsTask.CanCancel
+
+
+# ── QGIS 3 / QGIS 4 compatibility helpers ────────────────────────────────────
+
+def _rb_add_menu(iface, text, action):
+    """addPluginToRasterMenu was removed in some QGIS 4 builds."""
+    for method in ('addPluginToRasterMenu', 'addPluginToMenu'):
+        fn = getattr(iface, method, None)
+        if fn:
+            fn(text, action)
+            return
+
+def _rb_remove_menu(iface, text, action):
+    for method in ('removePluginRasterMenu', 'removePluginMenu'):
+        fn = getattr(iface, method, None)
+        if fn:
+            fn(text, action)
+            return
+
+def _rb_add_map_layer(layer):
+    """addMapLayer renamed/reorganised in QGIS 4."""
+    project = QgsProject.instance()
+    fn = getattr(project, 'addMapLayer', None)
+    if fn:
+        try:
+            fn(layer); return
+        except TypeError:
+            pass
+    fn = getattr(project, 'addMapLayers', None)
+    if fn:
+        fn([layer])
+
+
+def _rb_mem_config():
+    """
+    Return (gdal_cachemax_mb, warp_mem_mb) scaled to this machine's physical
+    RAM so GDAL uses a meaningful chunk of memory instead of a fixed ~1 GB.
+
+    Falls back to conservative 1 GB values when total RAM can't be determined.
+    """
+    total_mb = None
+
+    # Preferred: psutil (bundled with some QGIS installs)
+    try:
+        import psutil
+        total_mb = psutil.virtual_memory().total // (1024 * 1024)
+    except Exception:
+        pass
+
+    # Fallback: platform APIs
+    if not total_mb:
+        try:
+            if os.name == 'nt':
+                import ctypes
+
+                class _MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ('dwLength', ctypes.c_ulong),
+                        ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                    ]
+
+                stat = _MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                total_mb = int(stat.ullTotalPhys // (1024 * 1024))
+            else:
+                total_mb = int(
+                    (os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES'))
+                    // (1024 * 1024)
+                )
+        except Exception:
+            total_mb = None
+
+    if not total_mb or total_mb <= 0:
+        return 1024, 1024
+
+    # Block cache: half of RAM, capped so we never starve QGIS / the OS.
+    cache_mb = max(1024, min(int(total_mb * 0.5), 16384))
+    # Warp operation memory: a quarter of RAM, similarly capped.
+    warp_mb = max(1024, min(int(total_mb * 0.25), 8192))
+    return cache_mb, warp_mb
+
+
+# ── GDAL Python API helpers ─────────────────────────────────────────────────
+#
+# The plugin drives GDAL through osgeo.gdal rather than spawning gdal_translate
+# / gdalwarp subprocesses. Benefits: a real progress callback (no stderr regex
+# parsing), no dependency on the CLI tools being on PATH, no Windows command
+# line length limit with large GCP sets, and no temp .vrt files on disk.
+
+@contextmanager
+def _rb_gdal_config(options):
+    """Apply GDAL config options for the duration of the block, then restore."""
+    previous = {}
+    try:
+        for key, value in options.items():
+            previous[key] = gdal.GetConfigOption(key)
+            gdal.SetConfigOption(key, str(value))
+        yield
+    finally:
+        for key, value in previous.items():
+            gdal.SetConfigOption(key, value)
+
+
+@contextmanager
+def _rb_gdal_env(num_threads, cache_mb):
+    """
+    Apply the resource settings (thread count + block cache) for one GDAL
+    operation, restoring the previous values afterwards.
+    """
+    prev_cache = gdal.GetCacheMax()
+    prev_threads = gdal.GetConfigOption('GDAL_NUM_THREADS')
+    try:
+        if cache_mb:
+            gdal.SetCacheMax(int(cache_mb) * 1024 * 1024)
+        gdal.SetConfigOption('GDAL_NUM_THREADS', str(num_threads))
+        yield
+    finally:
+        gdal.SetCacheMax(prev_cache)
+        gdal.SetConfigOption('GDAL_NUM_THREADS', prev_threads)
+
+
+def _rb_progress_cb(task, base=0.0, span=100.0):
+    """
+    Build a GDAL progress callback bound to a QgsTask.
+
+    GDAL calls it as ``callback(complete, message, cb_data)`` with ``complete``
+    in 0..1. Returning 0 aborts the running GDAL operation, which is how a
+    cancelled task stops the work mid-flight.
+    """
+    def callback(complete, message, cb_data):
+        try:
+            task.setProgress(base + max(0.0, min(1.0, complete)) * span)
+        except Exception:
+            pass
+        return 0 if task.isCanceled() else 1
+    return callback
+
+
+def _rb_transform_options(transform):
+    """Map a UI transformation name to gdal.WarpOptions keyword arguments."""
+    tl = transform.lower()
+    if tl == 'tps':
+        return {'tps': True}
+    if tl == 'rpc':
+        return {'rpc': True}
+    if tl == 'geoloc':
+        return {'geoloc': True}
+    if tl.startswith('polynomial'):
+        try:
+            order = int(tl.split('order')[-1].strip().strip(')').strip())
+        except ValueError:
+            order = 1
+        return {'polynomialOrder': order}
+    return {}
+
+
+def _rb_overview_levels(width, height):
+    """Power-of-two overview factors down to ~256 px (gdaladdo-style defaults)."""
+    longest = max(width, height)
+    levels = []
+    factor = 2
+    while longest // factor > 256:
+        levels.append(factor)
+        factor *= 2
+    return levels or [2]
+
+
+def _rb_open_with_gcps(src_path, gcps, gcp_srs):
+    """
+    Open ``src_path`` and return an in-memory VRT dataset carrying ``gcps``.
+
+    ``gcps`` is a list of ``(pixel, line, mapX, mapY)`` tuples (the line value
+    is already sign-flipped by parse_points_file to match GDAL's convention).
+    """
+    src = gdal.Open(src_path, gdal.GA_ReadOnly)
+    if src is None:
+        raise RuntimeError('Cannot open input image: %s' % src_path)
+    gdal_gcps = [gdal.GCP(mx, my, 0.0, px, ln) for (px, ln, mx, my) in gcps]
+    vrt = gdal.Translate(
+        '', src,
+        options=gdal.TranslateOptions(
+            format='VRT', GCPs=gdal_gcps, outputSRS=gcp_srs
+        )
+    )
+    src = None
+    if vrt is None:
+        raise RuntimeError(gdal.GetLastErrorMsg() or 'Failed to attach GCPs')
+    return vrt
+
+
+def _rb_cog_creation_options(compress, quality, num_threads):
+    """COG driver creation options for the given compression."""
+    co = [
+        'COMPRESS=%s' % compress,
+        'NUM_THREADS=%s' % num_threads,
+        'BLOCKSIZE=512',
+        'BIGTIFF=YES',
+        'OVERVIEW_RESAMPLING=LANCZOS',
+    ]
+    if compress in ('WEBP', 'JPEG'):
+        # COG driver uses QUALITY for both JPEG and WEBP (there is no WEBP_LEVEL
+        # here — passing it silently left WEBP at the default quality of 75).
+        co.append('QUALITY=%s' % quality)
+    elif compress in ('LZW', 'DEFLATE', 'ZSTD'):
+        co.append('PREDICTOR=YES')
+    return co
+
+
+def _rb_gtiff_creation_options(compress, quality, num_threads):
+    """GTiff driver creation options for the given compression."""
+    co = [
+        'BIGTIFF=YES',
+        'TILED=YES',
+        'NUM_THREADS=%s' % num_threads,
+        'COMPRESS=%s' % compress,
+    ]
+    if compress == 'WEBP':
+        co += ['WEBP_LEVEL=%s' % quality, 'WEBP_LOSSLESS=NO']
+    elif compress == 'JPEG':
+        co.append('JPEG_QUALITY=%s' % quality)
+    elif compress in ('LZW', 'DEFLATE', 'ZSTD'):
+        # GTiff driver wants a numeric predictor (2 = horizontal, for integer
+        # imagery); 'YES' is a COG-driver spelling the GTiff driver rejects.
+        co.append('PREDICTOR=2')
+    return co
+
+
+def _rb_overview_config(compress, quality):
+    """Config options so internal overviews inherit the main compression.
+
+    Thread count is not set here — the caller's _rb_gdal_env already exports
+    GDAL_NUM_THREADS, which the overview builder honours.
+    """
+    cfg = {'COMPRESS_OVERVIEW': compress}
+    if compress == 'WEBP':
+        cfg['WEBP_LEVEL_OVERVIEW'] = str(quality)
+    elif compress == 'JPEG':
+        cfg['JPEG_QUALITY_OVERVIEW'] = str(quality)
+    elif compress in ('LZW', 'DEFLATE', 'ZSTD'):
+        cfg['PREDICTOR_OVERVIEW'] = '2'
+    return cfg
+
+
+# Qgis message levels
+try:
+    # QGIS 4 — scoped enum  (Qgis.MessageLevel.Info etc.)
+    _ml = Qgis.MessageLevel
+    QgisInfo     = _ml.Info
+    QgisWarning  = _ml.Warning
+    QgisCritical = _ml.Critical
+    QgisSuccess  = _ml.Success
+except AttributeError:
+    # QGIS 3 — unscoped (Qgis.Info etc.)
+    QgisInfo     = Qgis.Info
+    QgisWarning  = Qgis.Warning
+    QgisCritical = Qgis.Critical
+    try:
+        QgisSuccess = Qgis.Success
+    except AttributeError:
+        QgisSuccess = Qgis.Info  # Qgis.Success not in very early QGIS 3
+
+# QDialog.exec — exec_() was removed in Qt6
+def _exec_dialog(dlg):
+    """Call exec() or exec_() depending on Qt version."""
+    if hasattr(dlg, 'exec') and callable(dlg.exec):
+        return dlg.exec()
+    return dlg.exec_()  # type: ignore[attr-defined]
 
 
 class GdalTask(QgsTask):
     """
-    Background task for running GDAL commands without freezing the UI.
-    Parses GDAL progress output to update the task progress bar.
+    Background task that runs one GDAL operation off the UI thread.
+
+    ``work_fn(task)`` performs the GDAL calls (via osgeo.gdal) and returns a
+    truthy value on success. It should use ``task.isCanceled()`` and the
+    progress callbacks from ``_rb_progress_cb`` so cancellation takes effect.
     """
-    
-    def __init__(self, description, commands, cleanup_files=None, output_file=None):
-        """
-        Args:
-            description: Task description shown in task manager
-            commands: List of (cmd_list, cmd_description) tuples to execute
-            cleanup_files: List of temp files to delete after completion
-            output_file: Path to output file (for auto-loading)
-        """
-        super().__init__(description, QgsTask.CanCancel)
-        self.commands = commands
-        self.cleanup_files = cleanup_files or []
+
+    def __init__(self, description, work_fn, output_file=None):
+        super().__init__(description, QgsTaskCanCancel)
+        self._work_fn = work_fn
         self.output_file = output_file
         self.error_message = None
         self.elapsed_time = 0
         self.exception = None
-    
+
     def run(self):
-        """Execute GDAL commands in background thread."""
+        """Execute the GDAL work function in a background thread."""
         start_time = time.time()
-        total_commands = len(self.commands)
-        
+        gdal.ErrorReset()
         try:
-            for idx, (cmd, cmd_desc) in enumerate(self.commands):
-                if self.isCanceled():
-                    return False
-                
-                # Base progress for this command
-                base_progress = (idx / total_commands) * 100
-                command_weight = 100 / total_commands
-                
-                QgsMessageLog.logMessage(
-                    f'Raster Blaster: Running {cmd_desc}',
-                    'Raster Blaster', level=Qgis.Info
-                )
-                QgsMessageLog.logMessage(
-                    f'Command: {" ".join(cmd)}',
-                    'Raster Blaster', level=Qgis.Info
-                )
-                
-                # Run process and capture progress
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1
-                )
-                
-                # Read stderr for progress updates (GDAL outputs progress there)
-                stderr_output = []
-                while True:
-                    if self.isCanceled():
-                        process.terminate()
-                        return False
-                    
-                    line = process.stderr.readline()
-                    if not line and process.poll() is not None:
-                        break
-                    
-                    if line:
-                        stderr_output.append(line)
-                        # Parse GDAL progress (format: "...10...20...30..." or percentage)
-                        progress_match = re.search(r'(\d+)(?:\.\d+)?%?\.{0,3}$', line.strip())
-                        if progress_match:
-                            try:
-                                pct = float(progress_match.group(1))
-                                overall = base_progress + (pct / 100) * command_weight
-                                self.setProgress(overall)
-                            except ValueError:
-                                pass
-                
-                # Get remaining output
-                _, remaining_stderr = process.communicate()
-                stderr_output.append(remaining_stderr)
-                
-                if process.returncode != 0:
-                    self.error_message = ''.join(stderr_output).strip()
-                    return False
-                
-                # Update progress for completed command
-                self.setProgress(base_progress + command_weight)
-            
+            ok = bool(self._work_fn(self))
             self.elapsed_time = time.time() - start_time
-            return True
-            
+            if not ok and not self.error_message and not self.isCanceled():
+                self.error_message = gdal.GetLastErrorMsg() or 'GDAL operation failed'
+            return ok
         except Exception as e:
+            if self.isCanceled():
+                # GDAL raises "User terminated" when the progress callback aborts
+                # a cancelled run — that's expected, not an error.
+                return False
             self.exception = e
-            self.error_message = str(e)
+            self.error_message = str(e) or gdal.GetLastErrorMsg() or repr(e)
+            QgsMessageLog.logMessage(
+                f'Raster Blaster: {self.error_message}',
+                'Raster Blaster', level=QgisCritical
+            )
             return False
-    
-    def finished(self, result):
-        """Called when task completes (in main thread)."""
-        # Clean up temp files
-        for f in self.cleanup_files:
-            try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except Exception:
-                pass
-    
+
     def cancel(self):
         """Handle task cancellation."""
         QgsMessageLog.logMessage(
             'Raster Blaster: Task cancelled by user',
-            'Raster Blaster', level=Qgis.Warning
+            'Raster Blaster', level=QgisWarning
         )
         super().cancel()
 
@@ -169,7 +390,9 @@ class raster_blaster:
     SETTING_TRANSFORM = 'transformation'
     SETTING_CRS = 'target_crs'
     SETTING_AUTO_LOAD = 'auto_load_result'
-    SETTING_JPEG_QUALITY = 'jpeg_quality'
+    SETTING_JPEG_QUALITY = 'jpeg_quality'  # also used for WEBP_LEVEL
+    SETTING_MAX_THREADS = 'max_threads'    # 0 = all logical CPUs
+    SETTING_CACHE_MB = 'cache_mb'          # 0 = auto (see _rb_mem_config)
     
     def __init__(self, iface):
         self.iface = iface
@@ -188,17 +411,17 @@ class raster_blaster:
         # Points→GeoTIFF
         self.act_full = QAction(icon, "Points→GeoTIFF", self.iface.mainWindow())
         self.act_full.triggered.connect(self.full_process_dialog)
-        self.iface.addPluginToRasterMenu("&Raster Blaster", self.act_full)
+        _rb_add_menu(self.iface, "&Raster Blaster", self.act_full)
 
         # Points→COG
         self.act_to_cog = QAction(icon, "Points→COG", self.iface.mainWindow())
         self.act_to_cog.triggered.connect(self.full_to_cog_dialog)
-        self.iface.addPluginToRasterMenu("&Raster Blaster", self.act_to_cog)
+        _rb_add_menu(self.iface, "&Raster Blaster", self.act_to_cog)
 
         # GeoTIFF→COG
         self.act_cog = QAction(icon, "GeoTIFF→COG", self.iface.mainWindow())
         self.act_cog.triggered.connect(self.gdal_cog_dialog)
-        self.iface.addPluginToRasterMenu("&Raster Blaster", self.act_cog)
+        _rb_add_menu(self.iface, "&Raster Blaster", self.act_cog)
         
         # Create main QGIS toolbar
         self.toolbar = self.iface.addToolBar("Raster Blaster")
@@ -224,7 +447,7 @@ class raster_blaster:
         # Remove menu items
         for act in (self.act_full, self.act_to_cog, self.act_cog):
             try:
-                self.iface.removePluginRasterMenu("&Raster Blaster", act)
+                _rb_remove_menu(self.iface, "&Raster Blaster", act)
             except Exception:
                 pass
         
@@ -241,7 +464,7 @@ class raster_blaster:
             if w.metaObject().className() == 'QgsGeoreferencerMainWindow':
                 QgsMessageLog.logMessage(
                     'Raster Blaster: Found Georeferencer', 
-                    'Raster Blaster', level=Qgis.Info
+                    'Raster Blaster', level=QgisInfo
                 )
                 self.setup_georef(w)
                 return
@@ -520,8 +743,8 @@ class raster_blaster:
             # Compression dropdown
             if field_type == 'compress':
                 combo = QComboBox()
-                combo.addItems(['JPEG', 'LZW', 'DEFLATE', 'PACKBITS', 'ZSTD', 'NONE'])
-                saved = self.get_setting(self.SETTING_COMPRESSION, 'JPEG')
+                combo.addItems(['WEBP', 'JPEG', 'LZW', 'DEFLATE', 'PACKBITS', 'ZSTD', 'NONE'])
+                saved = self.get_setting(self.SETTING_COMPRESSION, 'WEBP')
                 idx = combo.findText(saved)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
@@ -531,7 +754,7 @@ class raster_blaster:
                 inputs[key] = combo
                 continue
             
-            # JPEG Quality spinbox
+            # Quality spinbox (used for both JPEG quality and WEBP level)
             if field_type == 'jpeg_quality':
                 spin = QSpinBox()
                 spin.setRange(1, 100)
@@ -541,6 +764,35 @@ class raster_blaster:
                 hl.addWidget(spin)
                 options_layout.addLayout(hl)
                 inputs[key] = spin
+                
+                # Update label dynamically based on compression selection
+                def make_quality_updater(label_widget, spin_widget):
+                    def update_quality_label(compress_text):
+                        if compress_text == 'WEBP':
+                            label_widget.setText('WEBP Quality')
+                            spin_widget.setToolTip(
+                                'WEBP lossy quality (1-100). 85-90 recommended for Soar. '
+                                'Higher = better quality, larger file.'
+                            )
+                        elif compress_text == 'JPEG':
+                            label_widget.setText('JPEG Quality')
+                            spin_widget.setToolTip(
+                                'JPEG quality (1-100). Note: JPEG re-encodes overviews lossy. '
+                                'Consider WEBP for better overview quality.'
+                            )
+                        is_lossy = compress_text in ('WEBP', 'JPEG')
+                        spin_widget.setVisible(is_lossy)
+                        label_widget.setVisible(is_lossy)
+                    return update_quality_label
+                
+                updater = make_quality_updater(lbl, spin)
+                
+                # Connect to compress combo if it exists
+                if 'compress' in inputs:
+                    inputs['compress'].currentTextChanged.connect(updater)
+                    # Set initial state
+                    updater(inputs['compress'].currentText())
+                
                 continue
 
             # File selectors
@@ -629,7 +881,56 @@ class raster_blaster:
         
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
-        
+
+        # Performance group — how much of the machine GDAL is allowed to use.
+        perf_group = QGroupBox("Performance")
+        perf_layout = QVBoxLayout()
+
+        cpu_count = os.cpu_count() or 1
+        auto_cache_mb = _rb_mem_config()[0]
+
+        thr_hl = QHBoxLayout()
+        thr_lbl = QLabel("CPU threads")
+        thr_lbl.setMinimumWidth(120)
+        threads_spin = QSpinBox()
+        threads_spin.setRange(0, cpu_count)
+        threads_spin.setSpecialValueText(f"All ({cpu_count})")
+        try:
+            threads_spin.setValue(int(self.get_setting(self.SETTING_MAX_THREADS, '0') or 0))
+        except (TypeError, ValueError):
+            threads_spin.setValue(0)
+        threads_spin.setToolTip(
+            "Threads GDAL may use for warping and (de)compression.\n"
+            "0 = all logical CPUs. Lower it to keep cores free for other work."
+        )
+        thr_hl.addWidget(thr_lbl)
+        thr_hl.addWidget(threads_spin)
+        perf_layout.addLayout(thr_hl)
+        inputs['_threads'] = threads_spin
+
+        cache_hl = QHBoxLayout()
+        cache_lbl = QLabel("GDAL cache (MB)")
+        cache_lbl.setMinimumWidth(120)
+        cache_spin = QSpinBox()
+        cache_spin.setRange(0, 65536)
+        cache_spin.setSingleStep(256)
+        cache_spin.setSpecialValueText(f"Auto ({auto_cache_mb})")
+        try:
+            cache_spin.setValue(int(self.get_setting(self.SETTING_CACHE_MB, '0') or 0))
+        except (TypeError, ValueError):
+            cache_spin.setValue(0)
+        cache_spin.setToolTip(
+            "GDAL block cache size.\n"
+            "0 = auto (half of system RAM, capped at 16 GB)."
+        )
+        cache_hl.addWidget(cache_lbl)
+        cache_hl.addWidget(cache_spin)
+        perf_layout.addLayout(cache_hl)
+        inputs['_cache_mb'] = cache_spin
+
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+
         # Auto-load checkbox
         auto_load_cb = QCheckBox("Automatically add result to map")
         auto_load_cb.setChecked(self.get_setting(self.SETTING_AUTO_LOAD, 'true') == 'true')
@@ -666,8 +967,10 @@ class raster_blaster:
                 self.save_setting(self.SETTING_CRS, inputs['crs'].crs().authid())
             if 'jpeg_quality' in inputs:
                 self.save_setting(self.SETTING_JPEG_QUALITY, str(inputs['jpeg_quality'].value()))
+            self.save_setting(self.SETTING_MAX_THREADS, str(threads_spin.value()))
+            self.save_setting(self.SETTING_CACHE_MB, str(cache_spin.value()))
             self.save_setting(self.SETTING_AUTO_LOAD, 'true' if auto_load_cb.isChecked() else 'false')
-            
+
             # Collect values
             values = {}
             for lbl, key, ftype in fields:
@@ -680,13 +983,21 @@ class raster_blaster:
                     values[key] = widget.value()
                 else:
                     values[key] = widget.text()
-            
+
             values['auto_load'] = auto_load_cb.isChecked()
             values['progress'] = progress
             values['status'] = status_label
             values['dialog'] = dlg
             values['run_button'] = run_btn
-            
+
+            # Resource controls, resolved to concrete values for the GDAL calls.
+            auto_cache, auto_warp = _rb_mem_config()
+            threads_val = threads_spin.value()
+            values['num_threads'] = 'ALL_CPUS' if threads_val <= 0 else str(threads_val)
+            cache_val = cache_spin.value()
+            values['cache_mb'] = cache_val if cache_val > 0 else auto_cache
+            values['warp_mb'] = auto_warp
+
             callback(values)
         
         run_btn.clicked.connect(on_run)
@@ -696,11 +1007,7 @@ class raster_blaster:
         
         dlg.setLayout(layout)
         
-        # Qt5/Qt6 compatibility: exec_() renamed to exec() in Qt6
-        if hasattr(dlg, 'exec'):
-            dlg.exec()
-        else:
-            dlg.exec_()
+        _exec_dialog(dlg)
 
     # =========================================================================
     # GeoTIFF → COG
@@ -710,22 +1017,91 @@ class raster_blaster:
         self._gdal_dialog('GeoTIFF → COG', [
             ('Input GeoTIFF', 'input_file', 'input_file'),
             ('Compression', 'compress', 'compress'),
-            ('JPEG Quality', 'jpeg_quality', 'jpeg_quality'),
+            ('Quality', 'jpeg_quality', 'jpeg_quality'),
             ('Output COG', 'output_file', 'output_cog')
         ], self.gdal_cog)
 
-    def gdal_cog(self, values):
-        """Convert GeoTIFF to COG using background task."""
-        tif = values['input_file']
-        compress = values['compress']
-        jpeg_quality = values['jpeg_quality']
-        cog = values['output_file']
-        auto_load = values['auto_load']
+    def _run_task(self, task, values, out_path, label):
+        """
+        Wire a GdalTask to the dialog: show progress, react on completion,
+        auto-load the result, and keep the task alive while it runs.
+        """
         progress = values['progress']
         status = values['status']
         dlg = values['dialog']
         run_btn = values['run_button']
-        
+        auto_load = values['auto_load']
+
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        progress.setVisible(True)
+        status.setText("Processing...")
+        run_btn.setEnabled(False)
+
+        def on_progress(pct):
+            try:
+                progress.setValue(int(pct))
+            except RuntimeError:
+                pass  # dialog was closed
+
+        def on_finished():
+            try:
+                self.active_tasks.remove(task)
+            except ValueError:
+                pass
+            try:
+                progress.setVisible(False)
+                run_btn.setEnabled(True)
+            except RuntimeError:
+                return  # dialog gone; nothing left to update
+
+            if task.isCanceled():
+                status.setText("Cancelled")
+                return
+
+            if task.error_message:
+                status.setText(f"Error: {task.error_message[:100]}")
+                QgsMessageLog.logMessage(
+                    f'Raster Blaster: {label} failed: {task.error_message}',
+                    'Raster Blaster', level=QgisCritical
+                )
+                self.iface.messageBar().pushMessage(
+                    "Raster Blaster", f"{label} creation failed",
+                    level=QgisCritical
+                )
+                return
+
+            mins, secs = divmod(int(task.elapsed_time), 60)
+            status.setText(f"Complete! ({mins:02d}:{secs:02d})")
+            self.iface.messageBar().pushMessage(
+                "Raster Blaster",
+                f"{label} created: {os.path.basename(out_path)} ({mins:02d}:{secs:02d})",
+                level=QgisSuccess
+            )
+            if auto_load:
+                self.load_raster_layer(out_path)
+            try:
+                dlg.accept()
+            except RuntimeError:
+                pass
+
+        task.progressChanged.connect(on_progress)
+        task.taskCompleted.connect(on_finished)
+        task.taskTerminated.connect(on_finished)
+
+        QgsApplication.taskManager().addTask(task)
+        self.active_tasks.append(task)
+
+    def gdal_cog(self, values):
+        """Convert an existing GeoTIFF to a COG (GDAL COG driver, off-thread)."""
+        tif = values['input_file']
+        compress = values['compress']
+        quality = values['jpeg_quality']
+        cog = values['output_file']
+        dlg = values['dialog']
+        num_threads = values['num_threads']
+        cache_mb = values['cache_mb']
+
         # Validate inputs
         if not tif or not os.path.exists(tif):
             QMessageBox.warning(dlg, "Error", "Please select a valid input file.")
@@ -733,7 +1109,7 @@ class raster_blaster:
         if not cog:
             QMessageBox.warning(dlg, "Error", "Please specify an output file.")
             return
-        
+
         # Check if output file exists
         if os.path.exists(cog):
             reply = QMessageBox.question(
@@ -743,72 +1119,34 @@ class raster_blaster:
             )
             if reply == QMessageBoxNo:
                 return
-            # Delete existing file
             try:
                 os.remove(cog)
             except Exception as e:
                 QMessageBox.critical(dlg, "Error", f"Cannot delete existing file:\n{e}")
                 return
-        
-        # Build command
-        cmd = [
-            'gdal_translate', tif, cog,
-            '-of', 'COG',
-            '-co', f'COMPRESS={compress}',
-            '--config', 'GDAL_NUM_THREADS', 'ALL_CPUS'
-        ]
-        
-        # Add JPEG quality if using JPEG compression
-        if compress == 'JPEG':
-            cmd.extend(['-co', f'QUALITY={jpeg_quality}'])
-        
-        # Show progress
-        progress.setVisible(True)
-        progress.setValue(0)
-        status.setText("Processing...")
-        run_btn.setEnabled(False)
-        
-        # Create and run task
-        task = GdalTask(
-            'Raster Blaster: Creating COG',
-            [(cmd, 'gdal_translate → COG')],
-            output_file=cog
+
+        # Alpha bands are left intact — the COG driver handles transparency for
+        # every compression (JPEG via an internal mask, others as a real band).
+        creation_opts = _rb_cog_creation_options(compress, quality, num_threads)
+
+        def work(task):
+            with _rb_gdal_env(num_threads, cache_mb):
+                out = gdal.Translate(
+                    cog, tif,
+                    options=gdal.TranslateOptions(
+                        format='COG',
+                        creationOptions=creation_opts,
+                        callback=_rb_progress_cb(task),
+                    )
+                )
+                ok = out is not None
+                out = None
+            return ok
+
+        self._run_task(
+            GdalTask('Raster Blaster: Creating COG', work, output_file=cog),
+            values, cog, 'COG'
         )
-        
-        def on_complete(exception, result=None):
-            progress.setVisible(False)
-            run_btn.setEnabled(True)
-            
-            if task.error_message:
-                status.setText(f"Error: {task.error_message[:100]}")
-                QgsMessageLog.logMessage(
-                    f'Raster Blaster: COG failed: {task.error_message}',
-                    'Raster Blaster', level=Qgis.Critical
-                )
-                self.iface.messageBar().pushMessage(
-                    "Raster Blaster",
-                    f"COG creation failed",
-                    level=Qgis.Critical
-                )
-            else:
-                mins, secs = divmod(int(task.elapsed_time), 60)
-                status.setText(f"Complete! ({mins:02d}:{secs:02d})")
-                self.iface.messageBar().pushMessage(
-                    "Raster Blaster",
-                    f"COG created: {os.path.basename(cog)} ({mins:02d}:{secs:02d})",
-                    level=Qgis.Success
-                )
-                
-                if auto_load:
-                    self.load_raster_layer(cog)
-                
-                dlg.accept()
-        
-        task.taskCompleted.connect(lambda: on_complete(None))
-        task.taskTerminated.connect(lambda: on_complete(task.exception))
-        
-        QgsApplication.taskManager().addTask(task)
-        self.active_tasks.append(task)
 
     # =========================================================================
     # Points → GeoTIFF
@@ -834,26 +1172,25 @@ class raster_blaster:
             ('Transformation', 'transform', 'transform'),
             ('Resampling', 'resample', 'resample'),
             ('Compression', 'compress', 'compress'),
-            ('JPEG Quality', 'jpeg_quality', 'jpeg_quality'),
+            ('Quality', 'jpeg_quality', 'jpeg_quality'),
             ('Output GeoTIFF', 'output_file', 'output_geotiff')
         ], self.full_process, initial_values)
 
     def full_process(self, values):
-        """Create GeoTIFF from points file using background task."""
+        """Georeference points + image into a plain GeoTIFF (off-thread)."""
         pf = values['points_file']
         tif = values['input_file']
         crs = values['crs']
         transform = values['transform']
         resample = values['resample']
         compress = values['compress']
-        jpeg_quality = values['jpeg_quality']
+        quality = values['jpeg_quality']
         out_tif = values['output_file']
-        auto_load = values['auto_load']
-        progress = values['progress']
-        status = values['status']
         dlg = values['dialog']
-        run_btn = values['run_button']
-        
+        num_threads = values['num_threads']
+        cache_mb = values['cache_mb']
+        warp_mb = values['warp_mb']
+
         # Validate inputs
         if not pf or not os.path.exists(pf):
             QMessageBox.warning(dlg, "Error", "Please select a valid points file.")
@@ -913,90 +1250,59 @@ class raster_blaster:
             if reply == QMessageBoxNo:
                 return
         
-        # Create temp VRT path
-        tmp_vrt = tempfile.NamedTemporaryFile(delete=False, suffix='.vrt')
-        tmp_vrt.close()
-        vrt_path = tmp_vrt.name
-        
-        # Build gdal_translate command (create VRT with GCPs)
-        cmd1 = ['gdal_translate', '-of', 'VRT'] + gcp_data['args'] + [tif, vrt_path]
-        
-        # Build gdalwarp command
-        if transform.lower().startswith('polynomial'):
-            order = transform.split('order')[-1].strip().strip(')')
-            transform_args = ['-order', order]
-        else:
-            transform_args = [f'-{transform.lower()}']
-        
-        cmd2 = [
-            'gdalwarp',
-            '-t_srs', crs.authid(),
-            '-r', resample,
-            *transform_args,
-            '--config', 'GDAL_NUM_THREADS', 'ALL_CPUS',
-            '-wo', 'NUM_THREADS=ALL_CPUS',
-            '-multi',
-            '-co', 'BIGTIFF=YES',
-            '-co', 'TILED=YES',
-            '-co', f'COMPRESS={compress}'
-        ]
-        
-        if compress == 'JPEG':
-            cmd2.extend(['-co', f'JPEG_QUALITY={jpeg_quality}'])
-        
-        cmd2.extend([vrt_path, out_tif])
-        
-        # Show progress
-        progress.setVisible(True)
-        progress.setValue(0)
-        status.setText("Processing...")
-        run_btn.setEnabled(False)
-        
-        # Create task
-        task = GdalTask(
-            'Raster Blaster: Creating GeoTIFF',
-            [
-                (cmd1, 'gdal_translate → VRT'),
-                (cmd2, 'gdalwarp → GeoTIFF')
-            ],
-            cleanup_files=[vrt_path],
-            output_file=out_tif
+        # Alpha bands are left intact — gdalwarp preserves transparency (JPEG
+        # via an internal mask, other compressions as a real band).
+        transform_opts = _rb_transform_options(transform)
+        creation_opts = _rb_gtiff_creation_options(compress, quality, num_threads)
+        overview_cfg = _rb_overview_config(compress, quality)
+        # authid() is empty for a custom/user CRS — fall back to full WKT.
+        dst_srs = crs.authid() or crs.toWkt()
+        gcps = gcp_data['gcps']
+
+        def work(task):
+            with _rb_gdal_env(num_threads, cache_mb):
+                # In-memory VRT carrying the GCPs (no temp .vrt on disk).
+                vrt = _rb_open_with_gcps(tif, gcps, dst_srs)
+                if task.isCanceled():
+                    return False
+                warp_opts = gdal.WarpOptions(
+                    format='GTiff',
+                    dstSRS=dst_srs,
+                    resampleAlg=resample,
+                    multithread=True,
+                    warpMemoryLimit=warp_mb,
+                    warpOptions=['NUM_THREADS=%s' % num_threads],
+                    creationOptions=creation_opts,
+                    callback=_rb_progress_cb(task, 0.0, 90.0),
+                    **transform_opts
+                )
+                out = gdal.Warp(out_tif, vrt, options=warp_opts)
+                vrt = None
+                if out is None:
+                    return False
+                # Plain GeoTIFF gets no overviews from gdalwarp — build them so
+                # the result draws quickly in QGIS. A failure here still leaves
+                # a valid (overview-less) file, so don't fail the whole task.
+                if not task.isCanceled():
+                    levels = _rb_overview_levels(out.RasterXSize, out.RasterYSize)
+                    try:
+                        with _rb_gdal_config(overview_cfg):
+                            out.BuildOverviews(
+                                'LANCZOS', levels,
+                                callback=_rb_progress_cb(task, 90.0, 10.0)
+                            )
+                    except RuntimeError as e:
+                        QgsMessageLog.logMessage(
+                            f'Raster Blaster: overview build failed: {e}',
+                            'Raster Blaster', level=QgisWarning
+                        )
+                out = None
+            return not task.isCanceled()
+
+        self._run_task(
+            GdalTask('Raster Blaster: Creating GeoTIFF', work, output_file=out_tif),
+            values, out_tif, 'GeoTIFF'
         )
-        
-        def on_complete(exception, result=None):
-            progress.setVisible(False)
-            run_btn.setEnabled(True)
-            
-            if task.error_message:
-                status.setText(f"Error: {task.error_message[:100]}")
-                QgsMessageLog.logMessage(
-                    f'Raster Blaster: GeoTIFF failed: {task.error_message}',
-                    'Raster Blaster', level=Qgis.Critical
-                )
-                self.iface.messageBar().pushMessage(
-                    "Raster Blaster",
-                    "GeoTIFF creation failed",
-                    level=Qgis.Critical
-                )
-            else:
-                mins, secs = divmod(int(task.elapsed_time), 60)
-                status.setText(f"Complete! ({mins:02d}:{secs:02d})")
-                self.iface.messageBar().pushMessage(
-                    "Raster Blaster",
-                    f"GeoTIFF created: {os.path.basename(out_tif)} ({mins:02d}:{secs:02d})",
-                    level=Qgis.Success
-                )
-                
-                if auto_load:
-                    self.load_raster_layer(out_tif)
-                
-                dlg.accept()
-        
-        task.taskCompleted.connect(lambda: on_complete(None))
-        task.taskTerminated.connect(lambda: on_complete(task.exception))
-        
-        QgsApplication.taskManager().addTask(task)
-        self.active_tasks.append(task)
 
     # =========================================================================
     # Points → COG
@@ -1022,26 +1328,25 @@ class raster_blaster:
             ('Transformation', 'transform', 'transform'),
             ('Resampling', 'resample', 'resample'),
             ('Compression', 'compress', 'compress'),
-            ('JPEG Quality', 'jpeg_quality', 'jpeg_quality'),
+            ('Quality', 'jpeg_quality', 'jpeg_quality'),
             ('Output COG', 'output_file', 'output_cog')
         ], self.full_to_cog, initial_values)
 
     def full_to_cog(self, values):
-        """Create COG from points file using background task."""
+        """Georeference points + image straight into a COG (off-thread)."""
         pf = values['points_file']
         tif = values['input_file']
         crs = values['crs']
         transform = values['transform']
         resample = values['resample']
         compress = values['compress']
-        jpeg_quality = values['jpeg_quality']
+        quality = values['jpeg_quality']
         out_cog = values['output_file']
-        auto_load = values['auto_load']
-        progress = values['progress']
-        status = values['status']
         dlg = values['dialog']
-        run_btn = values['run_button']
-        
+        num_threads = values['num_threads']
+        cache_mb = values['cache_mb']
+        warp_mb = values['warp_mb']
+
         # Validate inputs
         if not pf or not os.path.exists(pf):
             QMessageBox.warning(dlg, "Error", "Please select a valid points file.")
@@ -1101,89 +1406,41 @@ class raster_blaster:
             if reply == QMessageBoxNo:
                 return
         
-        # Create temp VRT
-        tmp_vrt = tempfile.NamedTemporaryFile(delete=False, suffix='.vrt')
-        tmp_vrt.close()
-        vrt_path = tmp_vrt.name
-        
-        # Build commands
-        cmd1 = ['gdal_translate', '-of', 'VRT'] + gcp_data['args'] + [tif, vrt_path]
-        
-        if transform.lower().startswith('polynomial'):
-            order = transform.split('order')[-1].strip().strip(')')
-            transform_args = ['-order', order]
-        else:
-            transform_args = [f'-{transform.lower()}']
-        
-        cmd2 = [
-            'gdalwarp',
-            '-of', 'COG',
-            '-t_srs', crs.authid(),
-            '-r', resample,
-            *transform_args,
-            '--config', 'GDAL_NUM_THREADS', 'ALL_CPUS',
-            '-wo', 'NUM_THREADS=ALL_CPUS',
-            '-multi',
-            '-co', 'BIGTIFF=YES',
-            '-co', f'COMPRESS={compress}'
-        ]
-        
-        if compress == 'JPEG':
-            cmd2.extend(['-co', f'QUALITY={jpeg_quality}'])
-        
-        cmd2.extend([vrt_path, out_cog])
-        
-        # Show progress
-        progress.setVisible(True)
-        progress.setValue(0)
-        status.setText("Processing...")
-        run_btn.setEnabled(False)
-        
-        # Create task
-        task = GdalTask(
-            'Raster Blaster: Creating COG',
-            [
-                (cmd1, 'gdal_translate → VRT'),
-                (cmd2, 'gdalwarp → COG')
-            ],
-            cleanup_files=[vrt_path],
-            output_file=out_cog
+        # Alpha bands are left intact — the COG driver handles transparency for
+        # every compression (JPEG via an internal mask, others as a real band).
+        transform_opts = _rb_transform_options(transform)
+        creation_opts = _rb_cog_creation_options(compress, quality, num_threads)
+        # authid() is empty for a custom/user CRS — fall back to full WKT.
+        dst_srs = crs.authid() or crs.toWkt()
+        gcps = gcp_data['gcps']
+
+        def work(task):
+            with _rb_gdal_env(num_threads, cache_mb):
+                # In-memory VRT carrying the GCPs (no temp .vrt on disk).
+                vrt = _rb_open_with_gcps(tif, gcps, dst_srs)
+                if task.isCanceled():
+                    return False
+                warp_opts = gdal.WarpOptions(
+                    format='COG',
+                    dstSRS=dst_srs,
+                    resampleAlg=resample,
+                    multithread=True,
+                    warpMemoryLimit=warp_mb,
+                    warpOptions=['NUM_THREADS=%s' % num_threads],
+                    creationOptions=creation_opts,
+                    callback=_rb_progress_cb(task),
+                    **transform_opts
+                )
+                out = gdal.Warp(out_cog, vrt, options=warp_opts)
+                vrt = None
+                ok = out is not None
+                out = None
+            return ok and not task.isCanceled()
+
+        self._run_task(
+            GdalTask('Raster Blaster: Creating COG', work, output_file=out_cog),
+            values, out_cog, 'COG'
         )
-        
-        def on_complete(exception, result=None):
-            progress.setVisible(False)
-            run_btn.setEnabled(True)
-            
-            if task.error_message:
-                status.setText(f"Error: {task.error_message[:100]}")
-                QgsMessageLog.logMessage(
-                    f'Raster Blaster: COG failed: {task.error_message}',
-                    'Raster Blaster', level=Qgis.Critical
-                )
-                self.iface.messageBar().pushMessage(
-                    "Raster Blaster",
-                    "COG creation failed",
-                    level=Qgis.Critical
-                )
-            else:
-                mins, secs = divmod(int(task.elapsed_time), 60)
-                status.setText(f"Complete! ({mins:02d}:{secs:02d})")
-                self.iface.messageBar().pushMessage(
-                    "Raster Blaster",
-                    f"COG created: {os.path.basename(out_cog)} ({mins:02d}:{secs:02d})",
-                    level=Qgis.Success
-                )
-                
-                if auto_load:
-                    self.load_raster_layer(out_cog)
-                
-                dlg.accept()
-        
-        task.taskCompleted.connect(lambda: on_complete(None))
-        task.taskTerminated.connect(lambda: on_complete(task.exception))
-        
-        QgsApplication.taskManager().addTask(task)
-        self.active_tasks.append(task)
 
     # =========================================================================
     # Utility methods
@@ -1245,7 +1502,7 @@ class raster_blaster:
             except (KeyError, ValueError) as e:
                 QgsMessageLog.logMessage(
                     f'Raster Blaster: Skipping invalid GCP row: {e}',
-                    'Raster Blaster', level=Qgis.Warning
+                    'Raster Blaster', level=QgisWarning
                 )
                 continue
         
@@ -1356,7 +1613,7 @@ class raster_blaster:
                 )
         
         return None
-    
+
     def load_raster_layer(self, filepath):
         """Load a raster file into QGIS as a new layer."""
         try:
@@ -1364,18 +1621,18 @@ class raster_blaster:
             layer = QgsRasterLayer(filepath, name)
             
             if layer.isValid():
-                QgsProject.instance().addMapLayer(layer)
+                _rb_add_map_layer(layer)
                 QgsMessageLog.logMessage(
                     f'Raster Blaster: Added layer "{name}" to map',
-                    'Raster Blaster', level=Qgis.Info
+                    'Raster Blaster', level=QgisInfo
                 )
             else:
                 QgsMessageLog.logMessage(
                     f'Raster Blaster: Failed to load layer from {filepath}',
-                    'Raster Blaster', level=Qgis.Warning
+                    'Raster Blaster', level=QgisWarning
                 )
         except Exception as e:
             QgsMessageLog.logMessage(
                 f'Raster Blaster: Error loading layer: {e}',
-                'Raster Blaster', level=Qgis.Warning
+                'Raster Blaster', level=QgisWarning
             )

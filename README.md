@@ -1,6 +1,6 @@
 # Raster Blaster
 
-Raster Blaster is a QGIS plugin that streamlines your raster georeferencing workflow by embedding GDAL's powerful command-line tools directly into the Georeferencer interface. It adds buttons for every step—from reading your GCPs .points file through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
+Raster Blaster is a QGIS plugin that streamlines your raster georeferencing workflow by wiring GDAL directly into the Georeferencer interface. It adds buttons for every step—from reading your GCPs .points file through to generating Cloud-Optimized GeoTIFFs (COGs)—all without ever leaving QGIS.
 
 This plugin allows people who don't know how to use code or command line interfaces to harness the full power of GDAL to speed up their workflows.
 
@@ -8,7 +8,7 @@ This plugin allows people who don't know how to use code or command line interfa
 
 ### Three Core Functions
 
-- **Points→GeoTIFF**: Reads your .points file (GCPs) and input image, creates an intermediate VRT, then warps it to a projected GeoTIFF in your chosen CRS.
+- **Points→GeoTIFF**: Reads your .points file (GCPs) and input image, attaches the GCPs in memory, then warps it to a projected GeoTIFF (with overviews) in your chosen CRS.
 - **Points→COG**: Same as Points→GeoTIFF, but outputs directly to a Cloud-Optimized GeoTIFF (COG).
 - **GeoTIFF→COG**: Converts an existing GeoTIFF into a COG.
 
@@ -33,9 +33,15 @@ All GDAL operations run in a background thread, keeping QGIS fully responsive du
 - max, min, med
 
 **Compression Options**:
-- JPEG (with adjustable quality 1-100%)
+- WEBP (default) and JPEG, with adjustable quality 1-100%
 - LZW, DEFLATE, PACKBITS, ZSTD
 - NONE
+
+### Uses Your Whole Machine
+
+By default GDAL is given every logical CPU and a block cache sized to your
+system RAM. A **Performance** panel in each dialog lets you cap the thread count
+and cache if you want to keep resources free for other work.
 
 ### Smart Validation
 
@@ -88,13 +94,14 @@ When you run Points→GeoTIFF or Points→COG:
 
 1. Parses your .points file (supports UTF-8 and Windows-1252 encoding)
 2. Validates GCP count and distribution for your chosen transformation
-3. Builds GCP arguments for GDAL
-4. Creates a temporary VRT with `gdal_translate -of VRT`
-5. Runs `gdalwarp` with your chosen CRS, resampling, and compression
-6. Cleans up temporary files
-7. Optionally loads the result into QGIS
+3. Attaches the GCPs to an in-memory VRT of your source image
+4. Runs `gdal.Warp` (the GDAL Python API) with your chosen CRS, resampling, and
+   compression, off the UI thread
+5. Builds overviews (Points→GeoTIFF) — the COG driver does this itself
+6. Optionally loads the result into QGIS
 
-The plugin uses multi-threading (`GDAL_NUM_THREADS=ALL_CPUS`) to maximize performance.
+The plugin runs GDAL multi-threaded (`NUM_THREADS=ALL_CPUS` by default) with a
+RAM-scaled block cache to maximise performance.
 
 ## Requirements
 
